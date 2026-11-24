@@ -1,0 +1,80 @@
+# Copy the latest SCF zip from wordpress.org to a release of this repo.
+# Publish only a zip whose files all match the official wordpress.org checksums.
+name: Mirror SCF
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SLUG: secure-custom-fields
+    steps:
+      # GitHub disables a schedule after 60 days without activity in the repo.
+      # Enable the workflow again on each run, so the schedule stays on.
+      - name: Keep the schedule on
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/mirror.yml/enable"
+
+      - name: Latest version
+        id: v
+        run: |
+          version=$(curl -fsS "https://api.wordpress.org/plugins/info/1.0/$SLUG.json" | jq -r .version)
+          if ! [[ "$version" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "::error::Unexpected version: $version"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "$version" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $version exists. Nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and check against the wordpress.org checksums
+        if: steps.v.outputs.exists != '1'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          mkdir -p work && cd work
+          curl -fsS -o "$SLUG.zip" "https://downloads.wordpress.org/plugin/$SLUG.$VERSION.zip"
+          curl -fsS -o checksums.json "https://downloads.wordpress.org/plugin-checksums/$SLUG/$VERSION.json"
+          [ "$(jq -r .version checksums.json)" = "$VERSION" ] || { echo "::error::The checksums are not for $VERSION."; exit 1; }
+          unzip -q "$SLUG.zip" -d unzipped
+          # The zip has 1 folder, $SLUG/. The checksum paths start inside it.
+          [ "$(ls unzipped)" = "$SLUG" ] || { echo "::error::The zip does not have the single folder $SLUG/."; exit 1; }
+          (cd "unzipped/$SLUG" && find . -type f | sed 's#^\./##' | sort) > zip-files.txt
+          jq -r '.files | keys[]' checksums.json | sort > sum-files.txt
+          if ! diff -u sum-files.txt zip-files.txt; then
+            echo "::error::The files in the zip are not the files in the checksums."; exit 1
+          fi
+          # A sha256 value is a string, or a list when more than 1 value is valid.
+          bad=0
+          while IFS= read -r f; do
+            have=$(sha256sum "unzipped/$SLUG/$f" | cut -d' ' -f1)
+            if ! jq -e --arg f "$f" --arg h "$have" '.files[$f].sha256 | if type == "array" then index($h) != null else . == $h end' checksums.json >/dev/null; then
+              echo "::error::Checksum mismatch: $f"; bad=1
+            fi
+          done < zip-files.txt
+          [ "$bad" = 0 ] || exit 1
+          echo "$VERSION: $(wc -l < zip-files.txt) files match the wordpress.org checksums." | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "zip sha256: $(sha256sum "$SLUG.zip" | cut -d' ' -f1)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the release
+        if: steps.v.outputs.exists != '1'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          gh release create "$VERSION" "work/$SLUG.zip" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --notes "Secure Custom Fields $VERSION, the unchanged zip from https://downloads.wordpress.org/plugin/$SLUG.$VERSION.zip. All files match https://downloads.wordpress.org/plugin-checksums/$SLUG/$VERSION.json. Changelog: https://wordpress.org/plugins/$SLUG/#developers"
