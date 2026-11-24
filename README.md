@@ -1,4 +1,4 @@
-# scf-mirror
+# scf-releases
 
 Release zips of [Secure Custom Fields](https://wordpress.org/plugins/secure-custom-fields/)
 (SCF), copied from wordpress.org.
